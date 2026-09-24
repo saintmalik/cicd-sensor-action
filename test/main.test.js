@@ -30,6 +30,11 @@ describe('input validation', () => {
     assert.throws(() => validateManagerUrl('not a url'), /not a valid URL/);
     assert.throws(() => validateManagerUrl('https://manager.example.com/\n--flag'), /whitespace or control/);
   });
+
+  it('allows loopback http manager URLs for colocated lab Managers', () => {
+    assert.equal(validateManagerUrl('http://127.0.0.1:18080'), 'http://127.0.0.1:18080/');
+    assert.equal(validateManagerUrl('http://localhost:18080'), 'http://localhost:18080/');
+  });
 });
 
 describe('systemd-run rendering', () => {
@@ -186,6 +191,49 @@ describe('project start args', () => {
     });
 
     assert.equal(args.includes('--ref-name'), false);
+  });
+
+  it('forwards manager-auth oidc without a manager-token-file', () => {
+    const args = renderProjectStartArgs({
+      socketPath: '/run/cicd-sensor/agent.sock',
+      providerHost: 'github.com',
+      managerUrl: 'http://127.0.0.1:18080/',
+      managerAuth: 'oidc',
+      idTokenAudience: 'http://127.0.0.1:18080',
+      env: {
+        GITHUB_REPOSITORY: 'acme/example',
+        GITHUB_RUN_ID: '123',
+        GITHUB_JOB: 'build',
+        GITHUB_RUN_ATTEMPT: '1',
+        RUNNER_TRACKING_ID: 'runner-1',
+      },
+    });
+    assert.equal(args.includes('--manager-url'), true);
+    assert.equal(args.includes('--manager-auth'), true);
+    assert.equal(args.includes('oidc'), true);
+    assert.equal(args.includes('--id-token-audience'), true);
+    assert.equal(args.includes('--manager-token-file'), false);
+  });
+
+  it('keeps manager-token-file on the classic manager-auth path', () => {
+    const args = renderProjectStartArgs({
+      socketPath: '/run/cicd-sensor/agent.sock',
+      providerHost: 'github.com',
+      managerUrl: 'https://manager.example.com/',
+      managerTokenFile: '/tmp/cicd-sensor-manager.token',
+      managerAuth: 'manager-token',
+      env: {
+        GITHUB_REPOSITORY: 'acme/example',
+        GITHUB_RUN_ID: '123',
+        GITHUB_JOB: 'build',
+        GITHUB_RUN_ATTEMPT: '1',
+        RUNNER_TRACKING_ID: 'runner-1',
+      },
+    });
+    assert.equal(args.includes('--manager-auth'), true);
+    assert.equal(args.includes('manager-token'), true);
+    assert.equal(args.includes('--manager-token-file'), true);
+    assert.equal(args.includes('/tmp/cicd-sensor-manager.token'), true);
   });
 });
 

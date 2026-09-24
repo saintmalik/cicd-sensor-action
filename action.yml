@@ -42,8 +42,10 @@ inputs:
   manager-url:
     description: >-
       Optional manager URL for host- and project-scope config. When set,
-      manager-token is also required, and project-local `.cicd-sensor/`
-      config is ignored (config is fetched from the manager).
+      either manager-token (classic) or manager-auth: oidc is required,
+      and project-local `.cicd-sensor/` config is ignored (config is
+      fetched from the manager). Prefer https://; loopback http is
+      allowed for colocated lab Managers only.
     required: false
     default: ""
 
@@ -52,9 +54,47 @@ inputs:
       Bearer token for the manager. Registered with `core.setSecret`
       and staged to a 0600 file under $RUNNER_TEMP; the raw value
       never crosses the agent's command line. The post step unlinks
-      the staged file before exiting.
+      the staged file before exiting. Required when manager-auth is
+      manager-token (default) and manager-url is set.
     required: false
     default: ""
+
+  manager-auth:
+    description: >-
+      Manager credential mode: manager-token (default) or oidc.
+      oidc forwards the runner's ACTIONS_ID_TOKEN_REQUEST_URL /
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN into project start so the Agent
+      re-mints GitHub Actions ID tokens for the whole job. Requires
+      permissions.id-token: write and an OIDC-capable Agent (pin
+      cicd-sensor-version + release-repository until upstream ships).
+    required: false
+    default: "manager-token"
+
+  id-token-audience:
+    description: >-
+      OIDC audience used when minting Actions ID tokens for Manager
+      auth. Defaults to the manager-url origin. Manager must be
+      configured with the same audience.
+    required: false
+    default: ""
+
+  id-token-request-url-hosts:
+    description: >-
+      Comma-separated allowlist for ACTIONS_ID_TOKEN_REQUEST_URL hosts
+      passed into Agent startup when this action launches the Agent
+      (GHES / non-default token hosts). Ignored when reusing a
+      host-operator Agent. Empty keeps Agent defaults.
+    required: false
+    default: ""
+
+  release-repository:
+    description: >-
+      GitHub repository (owner/name) that hosts the cicd-sensor
+      releases/v* assets this action downloads. Default is upstream
+      cicd-sensor/cicd-sensor. Override to pin a fork preview build
+      that includes Manager OIDC until upstream merges.
+    required: false
+    default: "cicd-sensor/cicd-sensor"
 
   enable-html-report:
     description: >-

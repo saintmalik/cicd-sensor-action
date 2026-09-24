@@ -13,7 +13,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import * as core from '@actions/core';
 
-const REPO = 'cicd-sensor/cicd-sensor';
+const DEFAULT_RELEASE_REPOSITORY = 'cicd-sensor/cicd-sensor';
 // Binary releases share the repo with rules releases under disjoint
 // tag namespaces, so binary tags carry a `releases/` prefix.
 const TAG_PREFIX = 'releases/';
@@ -27,6 +27,20 @@ function getAgentVersion() {
     throw new Error(`cicd-sensor-version must match vX.Y.Z, got '${v}'`);
   }
   return v;
+}
+
+function getReleaseRepository() {
+  const raw = (core.getInput('release-repository') || DEFAULT_RELEASE_REPOSITORY).trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw)) {
+    throw new Error(`release-repository must be owner/name, got '${raw}'`);
+  }
+  return raw;
+}
+
+function normalizeManagerAuth(raw) {
+  const mode = String(raw || 'manager-token').trim().toLowerCase();
+  if (mode === 'manager-token' || mode === 'oidc') return mode;
+  throw new Error(`manager-auth must be manager-token or oidc, got '${raw}'`);
 }
 const PROJECT_CONFIG_REPO_PATH = '.cicd-sensor/config.yaml';
 const PROJECT_RULES_REPO_PATH = '.cicd-sensor/rules';
@@ -74,7 +88,15 @@ function validateManagerUrl(value) {
   try { url = new URL(value); } catch (err) {
     throw new Error(`manager-url is not a valid URL: ${value}`);
   }
-  if (url.protocol !== 'https:') throw new Error(`manager-url must use https:// (got ${url.protocol})`);
+  const host = (url.hostname || '').toLowerCase();
+  const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  if (url.protocol === 'https:') {
+    // ok
+  } else if (url.protocol === 'http:' && isLoopback) {
+    // Colocated lab / same-job Manager only. Production Managers stay https.
+  } else {
+    throw new Error(`manager-url must use https:// (got ${url.protocol})`);
+  }
   rejectUnsafeArgValue(value, 'manager-url');
   return url.toString();
 }
@@ -85,12 +107,25 @@ function validateAbsolutePath(value, label) {
   return value;
 }
 
+function validateIdTokenAudience(value) {
+  if (!value) return '';
+  rejectUnsafeArgValue(value, 'id-token-audience');
+  return value;
+}
+
+function validateIdTokenRequestURLHosts(value) {
+  if (!value) return '';
+  rejectUnsafeArgValue(value, 'id-token-request-url-hosts');
+  return value;
+}
+
 // The manager is a project-scope concern carried in `project start`.
 // Agent start stays manager-agnostic so the action behaves the same
 // whether it owns the agent lifecycle or reuses one started by a host
-// operator.
-function agentCommandArgs({ socketPath }) {
-  return [
+// operator. Optional id-token-request-url-hosts is Agent startup config
+// (never widened via project start) for GHES / non-default mint hosts.
+function agentCommandArgs({ socketPath, idTokenRequestURLHosts = '' }) {
+  const args = [
     path.join(BIN_DIR, 'cicd-sensor'),
     'agent', 'start',
     '--socket', socketPath,
@@ -98,13 +133,17 @@ function agentCommandArgs({ socketPath }) {
     '--runner', RUNNER,
     '--shutdown-grace', `${AGENT_SHUTDOWN_GRACE_SECONDS}s`,
   ];
+  if (idTokenRequestURLHosts) {
+    args.push('--id-token-request-url-hosts', idTokenRequestURLHosts);
+  }
+  return args;
 }
 
 // Transient units keep CI cleanup simple: no unit files remain on the
 // host, but post can still inspect systemd state for action-managed
 // agents. The agent deliberately has no Restart= policy; if it dies,
 // post should report that fact rather than hide the gap.
-function renderAgentSystemdRunArgs({ socketPath, appArmorProfile }) {
+function renderAgentSystemdRunArgs({ socketPath, appArmorProfile, idTokenRequestURLHosts = '' }) {
   const args = [
     'systemd-run',
     `--unit=${AGENT_UNIT_NAME}`,
@@ -122,7 +161,7 @@ function renderAgentSystemdRunArgs({ socketPath, appArmorProfile }) {
   if (appArmorProfile) {
     args.push(`--property=AppArmorProfile=${appArmorProfile}`);
   }
-  return [...args, ...agentCommandArgs({ socketPath })];
+  return [...args, ...agentCommandArgs({ socketPath, idTokenRequestURLHosts })];
 }
 
 // The proxy is a recoverable socket relay, unlike the sensor itself.
@@ -298,6 +337,8 @@ function renderProjectStartArgs({
   projectRulesPath = '',
   managerUrl = '',
   managerTokenFile = '',
+  managerAuth = 'manager-token',
+  idTokenAudience = '',
   enableDebug = false,
   env = process.env,
 }) {
@@ -327,7 +368,13 @@ function renderProjectStartArgs({
   }
 
   if (managerUrl) {
-    projectArgs.push('--manager-url', managerUrl, '--manager-token-file', managerTokenFile);
+    const auth = normalizeManagerAuth(managerAuth);
+    projectArgs.push('--manager-url', managerUrl, '--manager-auth', auth);
+    if (auth === 'oidc') {
+      if (idTokenAudience) projectArgs.push('--id-token-audience', idTokenAudience);
+    } else {
+      projectArgs.push('--manager-token-file', managerTokenFile);
+    }
   } else {
     if (projectConfigPath) projectArgs.push('--config-file', projectConfigPath);
     if (projectRulesPath) projectArgs.push('--rules-file', projectRulesPath);
@@ -503,9 +550,10 @@ function stageReleaseBinaries(tmp) {
   const releaseTag = `${TAG_PREFIX}${agentVersion}`;
   const tarball = `cicd-sensor_${versionNoV}_linux_${arch}.tar.gz`;
   const tarballPath = path.join(stagedDir, tarball);
-  const downloadBase = `https://github.com/${REPO}/releases/download/${releaseTag}`;
+  const releaseRepository = getReleaseRepository();
+  const downloadBase = `https://github.com/${releaseRepository}/releases/download/${releaseTag}`;
 
-  core.info(`==> Downloading ${tarball}`);
+  core.info(`==> Downloading ${tarball} from ${releaseRepository}`);
   run('curl', [
     '--fail', '--silent', '--show-error', '--location',
     '--output', tarballPath, `${downloadBase}/${tarball}`,
@@ -532,9 +580,9 @@ function installAgentBinary(agentBin) {
   run('sudo', ['install', '-m', '755', agentBin, path.join(BIN_DIR, 'cicd-sensor')]);
 }
 
-function writeManagerTokenFile({ managerUrl, managerToken, tmp }) {
+function writeManagerTokenFile({ managerUrl, managerToken, managerAuth, tmp }) {
   let managerTokenFile = '';
-  if (managerUrl) {
+  if (managerUrl && normalizeManagerAuth(managerAuth) === 'manager-token') {
     managerTokenFile = path.join(tmp, 'cicd-sensor-manager.token');
     fs.writeFileSync(managerTokenFile, managerToken, { mode: 0o600 });
     // managerTokenFile is action-generated under RUNNER_TEMP; validate
@@ -544,13 +592,14 @@ function writeManagerTokenFile({ managerUrl, managerToken, tmp }) {
   return managerTokenFile;
 }
 
-async function startManagedAgent({ socketPath, tmp }) {
+async function startManagedAgent({ socketPath, tmp, idTokenRequestURLHosts = '' }) {
   const appArmorProfile = setupAppArmorProfile(tmp);
 
   core.info('==> Starting cicd-sensor');
   run('sudo', renderAgentSystemdRunArgs({
     socketPath,
     appArmorProfile,
+    idTokenRequestURLHosts,
   }));
 
   try {
@@ -563,14 +612,14 @@ async function startManagedAgent({ socketPath, tmp }) {
   }
 }
 
-async function installAndStartManagedAgent({ socketPath, tmp }) {
+async function installAndStartManagedAgent({ socketPath, tmp, idTokenRequestURLHosts = '' }) {
   // Keep all release download / binary install work before AppArmor
   // and systemd-run setup. If a release fetch fails, the host service
   // policy and Docker socket are untouched.
   const { agentBin, ctlBin } = stageReleaseBinaries(tmp);
   installAgentBinary(agentBin);
-  await startManagedAgent({ socketPath, tmp });
-  return { ctlBin };
+  await startManagedAgent({ socketPath, tmp, idTokenRequestURLHosts });
+  return { agentBin, ctlBin };
 }
 
 async function main() {
@@ -583,13 +632,38 @@ async function main() {
   const managerUrlRaw = core.getInput('manager-url');
   const managerUrl = managerUrlRaw ? validateManagerUrl(managerUrlRaw) : '';
   const managerToken = core.getInput('manager-token');
+  const managerAuth = normalizeManagerAuth(core.getInput('manager-auth') || 'manager-token');
+  const idTokenAudience = validateIdTokenAudience(core.getInput('id-token-audience'));
+  const idTokenRequestURLHosts = validateIdTokenRequestURLHosts(
+    core.getInput('id-token-request-url-hosts'),
+  );
   const enableHtmlReport = core.getBooleanInput('enable-html-report');
   const enableAttestationArtifact = core.getBooleanInput('enable-attestation-artifact');
   const enableDebug = core.getBooleanInput('enable-debug');
 
   if (managerToken && !managerUrl) throw new Error("'manager-token' set but 'manager-url' is empty");
-  if (managerUrl && !managerToken) throw new Error("'manager-url' set but 'manager-token' is empty");
+  if (managerUrl && managerAuth === 'manager-token' && !managerToken) {
+    throw new Error("'manager-url' set but 'manager-token' is empty (or set manager-auth: oidc)");
+  }
+  if (managerAuth === 'oidc' && !managerUrl) {
+    throw new Error("'manager-auth: oidc' requires 'manager-url'");
+  }
+  if (managerAuth === 'oidc' && managerToken) {
+    throw new Error("'manager-token' cannot be combined with manager-auth: oidc");
+  }
   if (managerToken) core.setSecret(managerToken);
+
+  if (managerAuth === 'oidc') {
+    const reqURL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
+    const reqTok = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
+    if (!reqURL || !reqTok) {
+      throw new Error(
+        "manager-auth: oidc requires ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN " +
+        "(set permissions.id-token: write on the job)",
+      );
+    }
+    core.setSecret(reqTok);
+  }
 
   const tmp = process.env.RUNNER_TEMP || '/tmp';
 
@@ -598,23 +672,30 @@ async function main() {
   const reuseAgent = !isGitHubHostedRunner() && socketIsLive(socketPath);
 
   // Token file is needed by `cicd-sensor project start --manager-token-file`
-  // regardless of whether this step starts a managed agent or reuses one
-  // that the host operator already started — the CLI forwards it into
-  // the project-start request body.
-  const managerTokenFile = writeManagerTokenFile({ managerUrl, managerToken, tmp });
+  // on the classic path whether this step starts a managed agent or reuses
+  // one the host operator already started.
+  const managerTokenFile = writeManagerTokenFile({
+    managerUrl, managerToken, managerAuth, tmp,
+  });
 
   core.saveState(STATE.reusedExistingAgent, reuseAgent ? 'true' : 'false');
 
   let ctlPath;
+  let agentCliPath = path.join(BIN_DIR, 'cicd-sensor');
   if (reuseAgent) {
     core.info(`==> Reusing existing cicd-sensor socket at ${socketPath}`);
     core.saveState(STATE.dockerProxyEnabled, 'false');
-    // ctl is staged into RUNNER_TEMP even in reuse mode so the post
-    // step never depends on host-installed paths and concurrent jobs
-    // on the same self-hosted host don't race on /usr/local/bin.
-    ({ ctlBin: ctlPath } = stageReleaseBinaries(tmp));
+    // ctl + CLI are staged into RUNNER_TEMP even in reuse mode so the post
+    // step / project start never depend on a stale host-installed path when
+    // pinning a fork preview Agent (OIDC). Concurrent jobs on the same
+    // self-hosted host don't race on /usr/local/bin.
+    ({ agentBin: agentCliPath, ctlBin: ctlPath } = stageReleaseBinaries(tmp));
   } else {
-    ({ ctlBin: ctlPath } = await installAndStartManagedAgent({ socketPath, tmp }));
+    ({ agentBin: agentCliPath, ctlBin: ctlPath } = await installAndStartManagedAgent({
+      socketPath,
+      tmp,
+      idTokenRequestURLHosts,
+    }));
 
     const snapshotPath = path.join(tmp, 'cicd-sensor-start.txt');
     fs.writeFileSync(snapshotPath, snapshotSystemd(AGENT_UNIT_NAME));
@@ -670,19 +751,22 @@ async function main() {
     }
   }
 
-  core.info('==> Registering project start');
+  core.info(`==> Registering project start (manager-auth=${managerAuth || 'none'})`);
   const projectArgs = renderProjectStartArgs({
     socketPath,
     projectConfigPath,
     projectRulesPath,
     managerUrl,
     managerTokenFile,
+    managerAuth,
+    idTokenAudience,
     enableDebug,
   });
 
   // project start authenticates via SO_PEERCRED PID against the tracked
   // Job's cgroup, not by UID; the agent socket is mode 0777, so no sudo.
-  run(path.join(BIN_DIR, 'cicd-sensor'), projectArgs);
+  // OIDC path inherits ACTIONS_ID_TOKEN_REQUEST_* from the runner env.
+  run(agentCliPath, projectArgs);
 
   core.info('==> cicd-sensor-action main: ready');
 }
@@ -699,6 +783,7 @@ if (isDirectRun()) {
 
 export {
   appArmorLSMEnabled,
+  normalizeManagerAuth,
   renderAgentSystemdRunArgs,
   renderAppArmorProfile,
   renderProjectStartArgs,
