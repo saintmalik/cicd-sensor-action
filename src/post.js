@@ -166,10 +166,28 @@ function verifyTamper() {
 // artifact generation
 // ─────────────────────────────────────────────────────────────────
 
+function shouldFinalizeProjectOnPost() {
+  const input = core.getInput('finalize-on-post').trim().toLowerCase();
+  if (input === 'true') return true;
+  if (input === 'false') return false;
+  // Third-party hosted runners (e.g. Blacksmith) set RUNNER_ENVIRONMENT=self-hosted
+  // but do not stop the agent on teardown (#195).
+  return (process.env.RUNNER_ENVIRONMENT || '') === 'self-hosted';
+}
+
+function finalizeProjectJob(socket) {
+  const args = ['project', 'end', ...jobIdentityArgs(socket)];
+  const r = spawnSync(BIN, args, { stdio: 'inherit' });
+  if (r.status !== 0) {
+    core.warning(`cicd-sensor project end exited with status ${r.status}`);
+    return false;
+  }
+  return true;
+}
+
 function finishProjectAndEmitResultLog(socket, outputPath) {
-  // `project result` is the action's final message to the agent for
-  // this job. It closes the project-side tracking state and writes the
-  // result document used by report / attestation generation.
+  // `project result` flushes buffered logs and writes the result document
+  // used by report / attestation generation; it does not finalize the job.
   const args = ['project', 'result', ...jobIdentityArgs(socket),
     '--output-file', outputPath];
   const r = spawnSync(BIN, args, { stdio: 'inherit' });
@@ -461,7 +479,14 @@ async function main() {
   core.setOutput('attestation-artifact-id', attestationArtifact?.id ? String(attestationArtifact.id) : '');
   core.setOutput('attestation-artifact-url', artifactUrl(attestationArtifact?.id) || '');
 
-  // 7. Unlink the staged manager token file.
+  // 7. Finalize project-only jobs when runner teardown will not signal the agent.
+  if (shouldFinalizeProjectOnPost()) {
+    if (finalizeProjectJob(socket)) {
+      core.info('cicd-sensor post: project end accepted');
+    }
+  }
+
+  // 8. Unlink the staged manager token file.
   const managerTokenFile = core.getState(STATE.managerTokenFile);
   if (managerTokenFile) unlinkSilently(managerTokenFile);
 

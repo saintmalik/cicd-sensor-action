@@ -74,6 +74,16 @@ inputs:
     required: false
     default: "true"
 
+  finalize-on-post:
+    description: >-
+      Finalize the project-only job from the post step so the Summary Log
+      reaches the manager when runner teardown will not signal the agent
+      (for example Blacksmith, #195). When unset, defaults to true only
+      when RUNNER_ENVIRONMENT is self-hosted; GitHub-hosted runners keep
+      shutdown finalization.
+    required: false
+    default: ""
+
   enable-debug:
     description: >-
       Upload a forensics bundle as the `cicd-sensor-debug` artifact.

@@ -31238,7 +31238,7 @@ function getIDToken(aud) {
 
 
 
-const REPO = 'cicd-sensor/cicd-sensor';
+const REPO = process.env.CICD_SENSOR_BINARY_REPO || 'cicd-sensor/cicd-sensor';
 // Binary releases share the repo with rules releases under disjoint
 // tag namespaces, so binary tags carry a `releases/` prefix.
 const TAG_PREFIX = 'releases/';
